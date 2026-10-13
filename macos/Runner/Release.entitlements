@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- git 客户端需要任意路径读写与出站网络（HTTPS/SSH、ssh-agent），
+	     App Sandbox 会全部卡死；分发为 ad-hoc 签名的开源工具，不开沙盒。 -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

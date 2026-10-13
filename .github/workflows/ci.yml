@@ -1,0 +1,673 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dart:
+    name: Dart analyze + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # NOTE: no `dart format --set-exit-if-changed` gate. The repo is formatted
+      # with an older Dart style; the stable formatter (tall style) rejects 21
+      # files, which would fail this job and skip every build job below
+      # (they all `needs: [dart]`). analyze --fatal-infos + test are the gates.
+      - run: flutter analyze --fatal-infos
+      - run: flutter test --no-pub
+
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # commit 类测试需要 git 身份（runner 默认没有）
+      - run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+      - run: cargo test --release
+        working-directory: rust
+
+  apk:
+    name: Android APK (arm64)
+    runs-on: ubuntu-latest
+    needs: [dart]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      # cargokit is unwired on Android by design: gradle packages the prebuilt
+      # .so committed at rust_builder/android/src/main/jniLibs/ (arm64-v8a,
+      # armeabi-v7a, x86_64), so no NDK/Rust toolchain is needed in this job.
+      # No release keystore in CI (key.properties is gitignored) → debug-signed
+      # artifact for verification, not for distribution.
+      - name: Build APKs (split per ABI)
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiwli-git-apk
+          path: build/app/outputs/flutter-apk/app-*-release.apk
+
+  linux:
+    name: Build Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [dart]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+            debarch: amd64
+            rpmarch: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            debarch: arm64
+            rpmarch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      # x64: official SDK archive via flutter-action. arm64: Flutter publishes
+      # NO linux-arm64 SDK archive (releases_linux.json has zero arm64 entries,
+      # verified 2026-10-14) → bootstrap from the git tag like the taixu
+      # toolchain does; the flutter tool self-hosts on arm64 via the published
+      # arm64 dart-sdk, and linux-arm64 engine artifacts exist in the cache.
+      - uses: subosito/flutter-action@v2
+        if: matrix.arch == 'x64'
+        with:
+          channel: stable
+          cache: true
+      - name: Install Flutter (arm64, git bootstrap)
+        if: matrix.arch == 'arm64'
+        run: |
+          git clone --depth 1 --branch 3.47.1 \
+            https://github.com/flutter/flutter.git "$HOME/flutter-sdk"
+          echo "$HOME/flutter-sdk/bin" >> "$GITHUB_PATH"
+      # cargokit builds the vendored libgit2/openssl during flutter build;
+      # the first run is slow (openssl), later runs hit the flutter cache.
+      - uses: dtolnay/rust-toolchain@stable
+      # ubuntu-latest no longer ships libgtk-3-dev preinstalled (CI run
+      # 38247091664: CMake Error — required packages not found: gtk+-3.0).
+      # (this job IS linux — no matrix condition here; a stale matrix.target
+      # condition silently skipped this step in run 38250399808)
+      - name: Install Linux desktop dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev ninja-build
+      - name: Build
+        run: |
+          flutter pub get
+          V="${GITHUB_REF_NAME#v}"; case "$GITHUB_REF_NAME" in v*) ;; *) V="0.0.0" ;; esac
+          flutter build linux --release --build-name="$V"
+      - name: Package
+        run: tar -czf aiwli-git-linux-${{ matrix.arch }}.tar.gz -C build/linux/${{ matrix.arch }}/release/bundle .
+      - name: Package deb
+        run: |
+          V="${GITHUB_REF_NAME#v}"; case "$GITHUB_REF_NAME" in v*) ;; *) V="0.0.0" ;; esac
+          mkdir -p deb/DEBIAN deb/opt/aiwli-git deb/usr/bin \
+            deb/usr/share/applications deb/usr/share/icons/hicolor/256x256/apps
+          cp -r build/linux/${{ matrix.arch }}/release/bundle/* deb/opt/aiwli-git/
+          ln -s /opt/aiwli-git/gitdeck deb/usr/bin/aiwli-git
+          cp macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_256.png \
+            deb/usr/share/icons/hicolor/256x256/apps/aiwli-git.png
+          cat > deb/usr/share/applications/aiwli-git.desktop <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=AiwliGit
+          Exec=/opt/aiwli-git/gitdeck
+          Icon=aiwli-git
+          Categories=Development;
+          EOF
+          cat > deb/DEBIAN/control <<EOF
+          Package: aiwli-git
+          Version: ${V}
+          Section: devel
+          Priority: optional
+          Architecture: ${{ matrix.debarch }}
+          Maintainer: zeplee <zeplee@users.noreply.github.com>
+          Depends: libgtk-3-0, libstdc++6, libglu1-mesa, libglib2.0-0, libblkid1, liblzma5
+          Description: AiwliGit - cross-platform Git client (Flutter + Rust)
+          EOF
+          dpkg-deb --build --root-owner-group deb aiwli-git-linux-${{ matrix.arch }}.deb
+      - name: Package rpm
+        run: |
+          set -x
+          V="${GITHUB_REF_NAME#v}"; case "$GITHUB_REF_NAME" in v*) ;; *) V="0.0.0" ;; esac
+          # ruby-dev/build-essential：fpm 依赖链里的原生扩展需要编译头文件
+          sudo apt-get install -y ruby ruby-dev build-essential >/dev/null
+          sudo gem install fpm --no-document
+          export PATH="$(ruby -e 'puts Gem.bindir'):$PATH"
+          # deb 已在此步之前构建完成；fpm 对 dir 输入里的绝对符号链接处理不稳，
+          # 先移除 /usr/bin 链接，改用 after-install 脚本在装机时重建。
+          # fpm 的 --after-install 要脚本文件路径（内联命令会被当文件读，run
+          # 38506268395：Errno::ENOENT）。
+          rm -f deb/usr/bin/aiwli-git
+          printf '#!/bin/sh\nln -sf /opt/aiwli-git/gitdeck /usr/bin/aiwli-git\n' \
+            > /tmp/aiwli-after-install.sh
+          fpm -s dir -t rpm -n aiwli-git -v "${V}" -a ${{ matrix.rpmarch }} \
+            --depends gtk3 \
+            --description "AiwliGit - cross-platform Git client (Flutter + Rust)" \
+            --after-install /tmp/aiwli-after-install.sh \
+            -C deb opt usr
+          mv -f aiwli-git-*.rpm "aiwli-git-linux-${{ matrix.arch }}.rpm"
+          ls -la aiwli-git-linux-${{ matrix.arch }}.rpm
+      - name: Package AppImage
+        if: matrix.arch == 'x64'
+        run: |
+          V="${GITHUB_REF_NAME#v}"; case "$GITHUB_REF_NAME" in v*) ;; *) V="0.0.0" ;; esac
+          bash tool/build_appimage.sh build/linux/x64/release/bundle "$V" aiwli-git-linux
+      - name: Dump build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          # only non-empty build-script outputs — the failing crate's stderr
+          # has content, the rest are empty. `|| true`: GitHub bash runs with
+          # -e -o pipefail, and head closing the pipe SIGPIPEs find into a
+          # step failure that would pollute "failed steps".
+          (find build -path '*cargokit_build*' -type f -name 'stderr' -size +0c 2>/dev/null | head -20 | while read -r f; do
+            echo "=== $f ==="; tail -40 "$f" 2>/dev/null
+          done) || true
+          (find build -path '*cargokit_build*' -type f \( -name 'stdout' -o -name 'output' \) -size +0c 2>/dev/null | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -20 "$f" 2>/dev/null
+          done) || true
+          (find build -type f \( -name '*.log' -o -name 'stderr*' -o -name 'stdout*' \) -size +0c 2>/dev/null | grep -v cargokit_build | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -30 "$f" 2>/dev/null
+          done) || true
+          echo "=== disk space ==="; df -h /d 2>/dev/null || true
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-linux
+          path: |
+            build/**/*.log
+            build/**/cargokit_build/**
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiwli-git-linux-${{ matrix.arch }}
+          path: |
+            aiwli-git-linux-${{ matrix.arch }}.tar.gz
+            aiwli-git-linux-${{ matrix.arch }}.deb
+            aiwli-git-linux-${{ matrix.arch }}.rpm
+            aiwli-git-linux-x86_64.AppImage
+
+  windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    needs: [dart]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        shell: pwsh
+        run: |
+          # Windows MAX_PATH (260): the cargokit build dir + the vendored
+          # openssl source tree exceed it — cl.exe dies with "Cannot open
+          # compiler generated file: ''". A junction to the checkout shortens
+          # every path by ~20 chars. (A subst drive ROOT was tried first: it
+          # fixed the C build, but the flutter tool writes PROJECT_DIR="X:\"
+          # into generated_config.cmake — the trailing backslash escapes the
+          # closing CMake quote and swallows the next entry, so tool_backend
+          # got PROJECT_DIR='X:;FLUTTER_TARGET=lib\main.dart'. A junction
+          # keeps a normal directory path with no trailing backslash.)
+          cmd /c "if exist D:\w rmdir D:\w"
+          cmd /c mklink /J D:\w ${{ github.workspace }}
+          cd D:\w
+          flutter pub get
+          flutter build windows --release --build-name="${GITHUB_REF_NAME#v}"
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath aiwli-git-windows-x64.zip
+      - name: Package installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '0.0.0' }
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAPP_VERSION=$v `
+            /DSourcePath="$PWD\build\windows\x64\runner\Release" windows/setup.iss
+          # Inno 的 OutputDir 相对于 .iss 所在目录（windows/），归位到工作区根
+          $exe = Get-ChildItem -Recurse -Filter "aiwli-git-windows-setup.exe" |
+            Select-Object -First 1
+          if ($exe) { Move-Item $exe.FullName ".\aiwli-git-windows-setup.exe" -Force }
+          else { Write-Error "setup.exe not found after ISCC"; exit 1 }
+      - name: Dump build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          # only non-empty build-script outputs — the failing crate's stderr
+          # has content, the rest are empty. `|| true`: GitHub bash runs with
+          # -e -o pipefail, and head closing the pipe SIGPIPEs find into a
+          # step failure that would pollute "failed steps".
+          (find build -path '*cargokit_build*' -type f -name 'stderr' -size +0c 2>/dev/null | head -20 | while read -r f; do
+            echo "=== $f ==="; tail -40 "$f" 2>/dev/null
+          done) || true
+          (find build -path '*cargokit_build*' -type f \( -name 'stdout' -o -name 'output' \) -size +0c 2>/dev/null | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -20 "$f" 2>/dev/null
+          done) || true
+          (find build -type f \( -name '*.log' -o -name 'stderr*' -o -name 'stdout*' \) -size +0c 2>/dev/null | grep -v cargokit_build | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -30 "$f" 2>/dev/null
+          done) || true
+          echo "=== disk space ==="; df -h /d 2>/dev/null || true
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-windows
+          path: |
+            build/**/*.log
+            build/**/cargokit_build/**
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiwli-git-windows
+          path: |
+            aiwli-git-windows-x64.zip
+            aiwli-git-windows-setup.exe
+
+  # Reports every job's outcome to the ci-status branch so the result is
+  # readable with plain git (no API token needed on the client side).
+  macos:
+    name: Build macOS (universal)
+    runs-on: macos-latest
+    needs: [dart]
+    # macOS runner 按 10 倍计费（私有仓库），只在发版时构建
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      # universal 兜底需要 x86_64 rust std 供 cargokit 交叉编译
+      - run: rustup target add x86_64-apple-darwin
+      # 实测（run 38504151773）：flutter build macos --release 默认 ARCHS_STANDARD
+      # 产出已含双架构的 universal 二进制（v1.1.0 的 "arm64" 命名实为 universal），
+      # 故先验证再决定是否需要双构建合并。
+      - name: Build (native)
+        run: |
+          flutter pub get
+          flutter build macos --release --build-name="${GITHUB_REF_NAME#v}"
+      - name: Ensure universal binary
+        run: |
+          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
+          BIN="$APP/Contents/MacOS/$(ls "$APP/Contents/MacOS" | head -1)"
+          ARCHS=$(lipo -info "$BIN" | sed 's/^.*: //')
+          echo "native build architectures: $ARCHS"
+          case "$ARCHS" in
+            *arm64*x86_64*|*x86_64*arm64*)
+              echo "默认构建已是 universal，无需合并" ;;
+            *arm64*)
+              echo "仅 arm64 → 双构建合并出 x86_64 切片（arch -x86_64 让 flutter 按 x64 主机自举，走 Rosetta）"
+              rm -rf /tmp/app-arm64 /tmp/app-x64 /tmp/uni.app
+              cp -R "$APP" /tmp/app-arm64
+              softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+              arch -x86_64 flutter build macos --release
+              APP2=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
+              cp -R "$APP2" /tmp/app-x64
+              cp -R /tmp/app-arm64 /tmp/uni.app
+              (cd /tmp/app-arm64 && find . -type f | while IFS= read -r f; do
+                 rel="${f#./}"
+                 if file "$f" | grep -q Mach-O && [ -f "/tmp/app-x64/$rel" ]; then printf '%s\n' "$rel"; fi
+               done) > /tmp/merge-list
+              while IFS= read -r f; do
+                lipo -create "/tmp/app-arm64/$f" "/tmp/app-x64/$f" -output "/tmp/uni.app/$f"
+              done < /tmp/merge-list
+              echo "merged: $(wc -l < /tmp/merge-list) Mach-O files"
+              codesign --force --deep -s - /tmp/uni.app
+              rm -rf "$APP" && cp -R /tmp/uni.app "$APP" ;;
+            *) echo "::error::意外的架构组合: $ARCHS"; exit 1 ;;
+          esac
+          echo "final: $(lipo -info "$BIN")"
+      - name: Package
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r -q -y aiwli-git-macos-universal.zip *.app
+          # dmg：mac 标准分发格式（UDZO 压缩，打开即见 .app 拖拽安装）
+          APP=$(ls -d *.app | head -1)
+          hdiutil create -volname "AiwliGit" -srcfolder "$APP" -ov -format UDZO \
+            aiwli-git-macos-universal.dmg
+      - name: Dump build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          # only non-empty build-script outputs — the failing crate's stderr
+          # has content, the rest are empty. `|| true`: GitHub bash runs with
+          # -e -o pipefail, and head closing the pipe SIGPIPEs find into a
+          # step failure that would pollute "failed steps".
+          (find build -path '*cargokit_build*' -type f -name 'stderr' -size +0c 2>/dev/null | head -20 | while read -r f; do
+            echo "=== $f ==="; tail -40 "$f" 2>/dev/null
+          done) || true
+          (find build -path '*cargokit_build*' -type f \( -name 'stdout' -o -name 'output' \) -size +0c 2>/dev/null | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -20 "$f" 2>/dev/null
+          done) || true
+          (find build -type f \( -name '*.log' -o -name 'stderr*' -o -name 'stdout*' \) -size +0c 2>/dev/null | grep -v cargokit_build | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -30 "$f" 2>/dev/null
+          done) || true
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-macos
+          path: |
+            build/**/*.log
+            build/**/cargokit_build/**
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiwli-git-macos
+          path: |
+            build/macos/Build/Products/Release/aiwli-git-macos-universal.zip
+            build/macos/Build/Products/Release/aiwli-git-macos-universal.dmg
+
+  ios:
+    name: Build iOS (arm64, unsigned)
+    runs-on: macos-latest
+    needs: [dart]
+    # macOS runner 按 10 倍计费（私有仓库），只在发版时构建
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Build (unsigned)
+        run: |
+          # rust_builder 只有 CocoaPods podspec（cargokit script_phase），
+          # 显式走 CocoaPods 集成，避免 flutter 3.47 默认 SPM 找不到 Package.swift
+          flutter config --no-enable-swift-package-manager
+          flutter pub get
+          flutter build ios --release --no-codesign --build-name="${GITHUB_REF_NAME#v}"
+      - name: Package unsigned ipa
+        run: |
+          mkdir Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -q -y -r aiwli-git-ios-arm64.ipa Payload
+          mkdir -p build/ios/dist
+          mv aiwli-git-ios-arm64.ipa build/ios/dist/
+      - name: Dump build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          (find build -path '*cargokit_build*' -type f -name 'stderr' -size +0c 2>/dev/null | head -20 | while read -r f; do
+            echo "=== $f ==="; tail -40 "$f" 2>/dev/null
+          done) || true
+          (find build -type f \( -name '*.log' -o -name 'stderr*' \) -size +0c 2>/dev/null | head -10 | while read -r f; do
+            echo "=== $f ==="; tail -30 "$f" 2>/dev/null
+          done) || true
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-ios
+          path: |
+            build/**/*.log
+            build/**/cargokit_build/**
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiwli-git-ios
+          path: build/ios/dist/aiwli-git-ios-arm64.ipa
+
+  report:
+    name: CI status report
+    needs: [dart, rust, apk, linux, windows, macos, ios]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          R_DART: ${{ needs.dart.result }}
+          R_RUST: ${{ needs.rust.result }}
+          R_APK: ${{ needs.apk.result }}
+          R_LINUX: ${{ needs.linux.result }}
+          R_WINDOWS: ${{ needs.windows.result }}
+          R_MACOS: ${{ needs.macos.result }}
+          R_IOS: ${{ needs.ios.result }}
+        run: |
+          {
+            echo "# CI status — run $RUN_ID"
+            echo
+            echo "commit: ${{ github.sha }}"
+            echo "time: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "- dart analyze+test: $R_DART"
+            echo "- rust tests: $R_RUST"
+            echo "- android arm64 apk: $R_APK"
+            echo "- linux x64: $R_LINUX"
+            echo "- windows x64: $R_WINDOWS"
+            echo "- macos arm64: $R_MACOS"
+            echo "- ios arm64 (unsigned): $R_IOS"
+            echo
+            echo "run: https://github.com/$REPO/actions/runs/$RUN_ID"
+          } > CI_STATUS.md
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=20" > jobs.json
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=20" > arts.json
+          python3 - <<'PY' >> CI_STATUS.md
+          import json, os, re, subprocess, urllib.request, urllib.error
+          jobs = json.load(open('jobs.json'))['jobs']
+          token = os.environ['GH_TOKEN']
+          repo = os.environ['REPO']
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect)
+
+          def fetch_signed(url):
+              # 302s to a signed URL; the auth header must NOT be forwarded
+              # there or the signed host rejects with 401
+              req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+              try:
+                  opener.open(req)
+                  return None
+              except urllib.error.HTTPError as e:
+                  if e.code in (301, 302, 303, 307):
+                      loc = e.headers.get('Location')
+                      if not loc:
+                          return None
+                      with urllib.request.urlopen(loc) as r:
+                          return r.read()
+                  raise
+
+          def fetch_log(job_id):
+              data = fetch_signed("https://api.github.com/repos/%s/actions/jobs/%s/logs" % (repo, job_id))
+              return None if data is None else data.decode('utf-8', 'replace').splitlines()
+
+          for j in jobs:
+              if j.get('conclusion') not in ('failure', 'cancelled'):
+                  continue
+              print("")
+              print("## FAIL: " + j['name'])
+              failed = [st['name'] for st in j.get('steps', []) if st.get('conclusion') == 'failure']
+              if failed:
+                  print("failed steps: " + " | ".join(failed))
+              try:
+                  lines = fetch_log(j['id'])
+                  if lines is None:
+                      print("(log unavailable: no redirect)")
+                      continue
+                  clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
+                  # diagnostics steps (dump/upload) run after the real failure —
+                  # cut there so the tail below is the failing step itself
+                  end = len(clean)
+                  for i, l in enumerate(clean):
+                      if 'only non-empty build-script outputs' in l or 'Post job cleanup' in l:
+                          end = i
+                          break
+                  build = clean[:end]
+                  print("failing step output tail:")
+                  print("```")
+                  print("\n".join(build[-70:]) if build else "(empty)")
+                  print("```")
+                  pats = ('##[error]', 'error[', 'error:', 'CMake Error', 'FAILED:',
+                          'fatal error', 'LNK1', 'MSB', 'panicked', 'cannot find',
+                          'undefined reference', 'Could not find', 'required packages')
+                  idx = [i for i, l in enumerate(build) if any(p in l for p in pats)]
+                  shown, seen = [], set()
+                  for i in idx[-10:]:
+                      for k in range(i, min(i + 5, len(build))):
+                          if k not in seen:
+                              seen.add(k)
+                              shown.append(build[k])
+                  if shown:
+                      print("error markers:")
+                      print("```")
+                      print("\n".join(shown[-50:]))
+                      print("```")
+              except Exception as e:
+                  print("(log unavailable: %s)" % e)
+
+          # build-script stderr/stdout from the uploaded log artifacts — the
+          # definitive per-crate error (the job log itself may truncate)
+          try:
+              arts = json.load(open('arts.json')).get('artifacts', [])
+              for a in arts:
+                  if 'build-logs' not in a.get('name', ''):
+                      continue
+                  print("")
+                  print("## build-script outputs: " + a['name'])
+                  data = fetch_signed(a['archive_download_url'])
+                  if data is None:
+                      print("(artifact unavailable)")
+                      continue
+                  open('a.zip', 'wb').write(data)
+                  subprocess.run(['unzip', '-oq', 'a.zip', '-d', 'art'], check=False)
+                  shown_total = 0
+                  for root, _, files in os.walk('art'):
+                      for f in sorted(files):
+                          if f not in ('stderr', 'stdout', 'output'):
+                              continue
+                          p = os.path.join(root, f)
+                          try:
+                              txt = open(p, 'rb').read().decode('utf-8', 'replace')
+                          except Exception:
+                              continue
+                          lines = [l for l in txt.splitlines() if l.strip()]
+                          # skip benign directive-only outputs (cargo:rerun-if…)
+                          interesting = [l for l in lines if not l.startswith('cargo:')]
+                          if not interesting:
+                              continue
+                          shown_total += 1
+                          if shown_total > 8:
+                              continue
+                          print("=== " + p.replace('art/', '', 1) + " ===")
+                          print("```")
+                          print("\n".join(interesting[-25:]))
+                          print("```")
+                  if shown_total == 0:
+                      print("(no non-trivial build-script output)")
+                  elif shown_total > 8:
+                      print("(+%d more omitted)" % (shown_total - 8))
+          except Exception as e:
+              print("(artifact collection failed: %s)" % e)
+          PY
+          cat CI_STATUS.md
+      - name: Push ci-status branch
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git checkout -B ci-status
+          git add CI_STATUS.md
+          git commit -m "ci: status for run ${{ github.run_id }}"
+          git push -f origin ci-status
+
+  # tag 推送（v*）时：把各平台产物挂到 GitHub Release。
+  # 平台 job 依赖 dart/rust 门，门挂了它们 skip，本 job 的 needs 也随之 skip。
+  release:
+    name: Publish to GitHub Releases
+    runs-on: ubuntu-latest
+    needs: [apk, linux, windows, macos, ios]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      # 一次性清理：版本号重开（自 1.0.0.0 起），删除旧编号的 release 与 tag。
+      # 跑完这一轮后此步骤会随后续提交移除。
+      - name: Delete legacy releases and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for TAG in v1.0.0 v1.0.0.2; do
+            RID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+            if [ -n "$RID" ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/releases/$RID" && echo "release $TAG deleted"
+            else
+              echo "release $TAG not found (skip)"
+            fi
+            if gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$TAG" 2>/dev/null; then
+              echo "tag $TAG deleted"
+            else
+              echo "tag $TAG not found or already gone (skip)"
+            fi
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'aiwli-git-*'
+          merge-multiple: true
+          path: dist
+      - name: Rename assets with version
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cd dist
+          for f in *; do
+            case "$f" in
+              app-arm64-v8a-release.apk)     mv "$f" "aiwli-git-${V}-android-arm64.apk" ;;
+              app-armeabi-v7a-release.apk)   mv "$f" "aiwli-git-${V}-android-armv7.apk" ;;
+              app-x86_64-release.apk)        mv "$f" "aiwli-git-${V}-android-x86_64.apk" ;;
+              aiwli-git-linux-x64.tar.gz)  mv "$f" "aiwli-git-${V}-linux-x64.tar.gz" ;;
+              aiwli-git-linux-x64.deb)     mv "$f" "aiwli-git-${V}-linux-x64.deb" ;;
+              aiwli-git-linux-arm64.tar.gz) mv "$f" "aiwli-git-${V}-linux-arm64.tar.gz" ;;
+              aiwli-git-linux-arm64.deb)   mv "$f" "aiwli-git-${V}-linux-arm64.deb" ;;
+              aiwli-git-linux-x64.rpm)     mv "$f" "aiwli-git-${V}-linux-x64.rpm" ;;
+              aiwli-git-linux-arm64.rpm)   mv "$f" "aiwli-git-${V}-linux-arm64.rpm" ;;
+              aiwli-git-linux-x86_64.AppImage) mv "$f" "aiwli-git-${V}-linux-x64.AppImage" ;;
+              aiwli-git-windows-x64.zip)   mv "$f" "aiwli-git-${V}-windows-x64.zip" ;;
+              aiwli-git-windows-setup.exe) mv "$f" "aiwli-git-${V}-windows-setup.exe" ;;
+              aiwli-git-macos-universal.zip) mv "$f" "aiwli-git-${V}-macos-universal.zip" ;;
+              aiwli-git-macos-universal.dmg) mv "$f" "aiwli-git-${V}-macos-universal.dmg" ;;
+              aiwli-git-ios-arm64.ipa)     mv "$f" "aiwli-git-${V}-ios-arm64.ipa" ;;
+            esac
+          done
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

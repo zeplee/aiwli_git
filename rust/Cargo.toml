@@ -1,0 +1,27 @@
+[package]
+name = "rust_lib_gitdeck"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", default-features = false, features = ["std"] }
+git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl", "ssh"] }
+# 直接依赖：信任锚必须走「内存注入」。
+# vendored OpenSSL 是 no-stdio 构建（其 configuration.h 定义 OPENSSL_NO_STDIO），
+# 于是任何「从文件加载 CA」都必然失败；只有 BIO_new_mem_buf + PEM_read_bio_X509
+# → GIT_OPT_ADD_SSL_X509_CERT 这条路可用。详见 util.rs 与 docs/14。
+# features 显式带 vendored：git2 的 vendored-openssl 是传递特性，CI 的
+# windows 构建上特性统一没生效（openssl-sys 走了 find_normal 找系统 OpenSSL
+# 直接失败），显式声明保证任何解析下都走全源码 vendored 构建。
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[features]
+default = ["vendored"]
+vendored = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

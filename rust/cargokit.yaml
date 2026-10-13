@@ -1,0 +1,7 @@
+cargo:
+  debug:
+    toolchain: stable
+  release:
+    toolchain: stable
+  profile:
+    toolchain: stable
