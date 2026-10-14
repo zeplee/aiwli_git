@@ -619,25 +619,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 一次性清理：版本号重开（自 1.0.0.0 起），删除旧编号的 release 与 tag。
-      # 跑完这一轮后此步骤会随后续提交移除。
-      - name: Delete legacy releases and tags
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for TAG in v1.0.0 v1.0.0.2; do
-            RID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .id 2>/dev/null || true)
-            if [ -n "$RID" ]; then
-              gh api -X DELETE "repos/${{ github.repository }}/releases/$RID" && echo "release $TAG deleted"
-            else
-              echo "release $TAG not found (skip)"
-            fi
-            if gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$TAG" 2>/dev/null; then
-              echo "tag $TAG deleted"
-            else
-              echo "tag $TAG not found or already gone (skip)"
-            fi
-          done
       - uses: actions/download-artifact@v4
         with:
           pattern: 'aiwli-git-*'
