@@ -120,3 +120,7 @@ rust 侧 git2 默认特性（https + ssh）+ vendored-libgit2 + vendored-openssl
 ## 许可
 
 AGPL-3.0-or-later（`LICENSE`）。本程序是自由软件：可自由使用、修改、再分发；**分发衍生版本（含修改版与嵌入本程序的整包）必须同样以 AGPL-3.0-or-later 开源，并向接收者提供完整对应源码**；通过网络提供服务（含托管/改造后仅作服务端运行）同样触发开源义务。闭源分发不允许；不对外分发的内部使用不产生义务。名称 "aiwli"、图标与品牌资产**不在** AGPL-3.0 授权范围内，fork 与二次分发须更名换图。第三方声明：`THIRD-PARTY-NOTICES.md`。
+
+## 社区
+
+- [LINUX DO](https://linux.do) — 新的理想型社区，本项目的开发与分享受益于此。
