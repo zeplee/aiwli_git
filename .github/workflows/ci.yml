@@ -600,14 +600,12 @@ jobs:
               print("(artifact collection failed: %s)" % e)
           PY
           cat CI_STATUS.md
-      - name: Push ci-status branch
-        run: |
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git checkout -B ci-status
-          git add CI_STATUS.md
-          git commit -m "ci: status for run ${{ github.run_id }}"
-          git push -f origin ci-status
+      - name: Upload status report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-status-report
+          path: CI_STATUS.md
+          if-no-files-found: ignore
 
   # tag 推送（v*）时：把各平台产物挂到 GitHub Release。
   # 平台 job 依赖 dart/rust 门，门挂了它们 skip，本 job 的 needs 也随之 skip。
